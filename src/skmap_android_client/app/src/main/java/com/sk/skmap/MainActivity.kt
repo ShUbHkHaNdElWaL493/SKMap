@@ -283,10 +283,11 @@ fun DashboardScreen(accel: String, gyro: String, timestamp: String, executor: Ex
             verticalArrangement = Arrangement.SpaceEvenly
         ) {
             // Grouped IMU Readings
-            DataSectionBlock(title = "IMU Readings") {
-                Text("Accel (m/s²): $accel", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground)
-                Spacer(modifier = Modifier.height(8.dp))
-                Text("Gyro (rad/s):  $gyro", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground)
+            DataSectionBlock(title = "Accelerometer (m/s²)") {
+                Text(accel, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground)
+            }
+            DataSectionBlock(title = "Gyroscope (rad/s)") {
+                Text(gyro, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground)
             }
 
             HorizontalDivider()
