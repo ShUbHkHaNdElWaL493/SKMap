@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(skmap_android_bridge)
+project(skmap_desktop_client)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -7,9 +7,23 @@ endif()
 
 # find dependencies
 find_package(ament_cmake REQUIRED)
-# uncomment the following section in order to fill in
-# further dependencies manually.
-# find_package(<dependency> REQUIRED)
+find_package(Boost REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(sensor_msgs REQUIRED)
+
+add_executable(skmap_desktop_client src/skmap_desktop_client.cpp)
+ament_target_dependencies(skmap_desktop_client rclcpp sensor_msgs)
+target_include_directories(skmap_desktop_client PUBLIC ${Boost_INCLUDE_DIRS})
+
+install(
+  DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME}
+)
+
+install(
+  TARGETS skmap_desktop_client
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
