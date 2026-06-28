@@ -394,7 +394,7 @@ fun SplashScreen(onTimeout: () -> Unit) {
         onTimeout()
     }
     Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize().background(Color(0xFF1E1E1E))) {
-        Text("SKMap", color = Color.White, fontSize = 56.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
+        Text("SKMap", color = Color(0xFFC62A2A), fontSize = 56.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
     }
 }
 
