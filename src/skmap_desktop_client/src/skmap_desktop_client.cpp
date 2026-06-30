@@ -34,7 +34,6 @@ class SKMapDesktopClientNode : public rclcpp::Node
         {
             boost::asio::ip::udp::endpoint sender_endpoint;
             boost::system::error_code error;
-            const char ack[] = "ACK";
             std::vector<uint8_t> buffer(256);
             while (rclcpp::ok())
             {
@@ -43,6 +42,7 @@ class SKMapDesktopClientNode : public rclcpp::Node
                 if (len >= 4 && std::memcmp(buffer.data(), "PING", 4) == 0)
                 {
                     boost::system::error_code ec;
+                    static const std::string ack = "ACK";
                     this->ping_socket.send_to(boost::asio::buffer(ack), sender_endpoint, 0, ec);
                     if (!ec)
                     {
