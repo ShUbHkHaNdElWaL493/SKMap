@@ -1,0 +1,1 @@
+sudo ufw allow 60000:60002/udp

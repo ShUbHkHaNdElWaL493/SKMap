@@ -8,6 +8,7 @@
 #define IMG_PORT 60002
 
 #include <boost/asio.hpp>
+#include <charconv>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -33,6 +34,7 @@ class SKMapDesktopClientNode : public rclcpp::Node
         {
             boost::asio::ip::udp::endpoint sender_endpoint;
             boost::system::error_code error;
+            const char ack[] = "ACK";
             std::vector<uint8_t> buffer(256);
             while (rclcpp::ok())
             {
@@ -40,7 +42,6 @@ class SKMapDesktopClientNode : public rclcpp::Node
                 if ((error == boost::asio::error::operation_aborted) || (error == boost::asio::error::bad_descriptor)) break;
                 if (len >= 4 && std::memcmp(buffer.data(), "PING", 4) == 0)
                 {
-                    std::string ack = "ACK";
                     boost::system::error_code ec;
                     this->ping_socket.send_to(boost::asio::buffer(ack), sender_endpoint, 0, ec);
                     if (!ec)
@@ -55,35 +56,35 @@ class SKMapDesktopClientNode : public rclcpp::Node
         {
             boost::asio::ip::udp::endpoint sender_endpoint;
             boost::system::error_code error;
-            std::vector<uint8_t> buffer(MAX_UDP_PAYLOAD);
+            std::vector<uint8_t> buffer(MAX_UDP_PAYLOAD + 1);
             while (rclcpp::ok())
             {
                 size_t len = this->imu_socket.receive_from(boost::asio::buffer(buffer), sender_endpoint, 0, error);
                 if ((error == boost::asio::error::operation_aborted) || (error == boost::asio::error::bad_descriptor)) break;
                 if (len > 4 && std::memcmp(buffer.data(), "IMU|", 4) == 0)
                 {
-                    std::string payload_str(reinterpret_cast<const char*>(buffer.data()), len);
+                    buffer[len] = '\0';
+                    std::string_view payload(reinterpret_cast<const char*>(buffer.data()), len);
                     size_t first_pipe = 3;
-                    size_t second_pipe = payload_str.find('|', first_pipe + 1);
+                    size_t second_pipe = payload.find('|', first_pipe + 1);
                     if (second_pipe != std::string::npos)
                     {
                         try
                         {
                             
-                            std::string ts_str = payload_str.substr(first_pipe + 1, second_pipe - first_pipe - 1);
-                            long long ts_ms = std::stoll(ts_str);
+                            int64_t ts_ms = 0;
+                            auto ts_view = payload.substr(first_pipe + 1, second_pipe - first_pipe - 1);
+                            std::from_chars(ts_view.data(), ts_view.data() + ts_view.size(), ts_ms);
                             rclcpp::Time stamp(ts_ms * 1000000LL);
 
-                            std::string csv_data = payload_str.substr(second_pipe + 1);
-                            std::stringstream ss(csv_data);
-                            std::string item;
-
-                            std::getline(ss, item, ','); float ax = std::stof(item);
-                            std::getline(ss, item, ','); float ay = std::stof(item);
-                            std::getline(ss, item, ','); float az = std::stof(item);
-                            std::getline(ss, item, ','); float gx = std::stof(item);
-                            std::getline(ss, item, ','); float gy = std::stof(item);
-                            std::getline(ss, item, ','); float gz = std::stof(item);
+                            const char* ptr = payload.data() + second_pipe + 1;
+                            char* next;
+                            float ax = std::strtof(ptr, &next); ptr = next + 1;
+                            float ay = std::strtof(ptr, &next); ptr = next + 1;
+                            float az = std::strtof(ptr, &next); ptr = next + 1;
+                            float gx = std::strtof(ptr, &next); ptr = next + 1;
+                            float gy = std::strtof(ptr, &next); ptr = next + 1;
+                            float gz = std::strtof(ptr, &next);
 
                             auto imu_msg = sensor_msgs::msg::Imu();
                             imu_msg.header.stamp = stamp;
@@ -117,22 +118,15 @@ class SKMapDesktopClientNode : public rclcpp::Node
                 if ((error == boost::asio::error::operation_aborted) || (error == boost::asio::error::bad_descriptor)) break;
                 if (len > 4 && std::memcmp(buffer.data(), "IMG|", 4) == 0)
                 {
-                    size_t second_pipe = 0;
-                    for (size_t i = 4; i < len; ++i)
+                    const void* second_pipe_ptr = std::memchr(buffer.data() + 4, '|', len - 4);
+                    if (second_pipe_ptr != nullptr)
                     {
-                        if (buffer[i] == '|')
-                        {
-                            second_pipe = i;
-                            break;
-                        }
-                    }
-                    if (second_pipe != 0 && second_pipe < len - 1)
-                    {
+                        size_t second_pipe = static_cast<const uint8_t*>(second_pipe_ptr) - buffer.data();
                         try
                         {
 
-                            std::string ts_str(reinterpret_cast<const char*>(buffer.data() + 4), second_pipe - 4);
-                            long long ts_ms = std::stoll(ts_str);
+                            int64_t ts_ms = 0;
+                            std::from_chars(reinterpret_cast<const char*>(buffer.data() + 4), reinterpret_cast<const char*>(buffer.data() + second_pipe), ts_ms);
                             rclcpp::Time stamp(ts_ms * 1000000LL);
 
                             auto img_msg = sensor_msgs::msg::CompressedImage();
