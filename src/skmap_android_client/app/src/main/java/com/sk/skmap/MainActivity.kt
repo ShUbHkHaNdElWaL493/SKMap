@@ -1,6 +1,7 @@
 package com.sk.skmap
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.graphics.Rect
@@ -10,8 +11,10 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Process
 import android.util.Log
-import android.util.Size
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -62,7 +65,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -88,11 +92,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var sensorManager: SensorManager
     private val udpStreamer = UdpStreamer()
 
+    private var sensorThread: HandlerThread? = null
+    private var sensorHandler: Handler? = null
+
     private var currentAppState by mutableStateOf(AppState.SPLASH)
     private var permissionsGranted by mutableStateOf(false)
 
     private var serverIp by mutableStateOf("192.168.1.100")
-    private var serverPort by mutableStateOf("9999")
     private var connectionError by mutableStateOf("")
     private var isConnecting by mutableStateOf(false)
 
@@ -157,11 +163,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                             when (currentAppState) {
                                 AppState.CONNECTING -> ConnectScreen(
                                     ip = serverIp,
-                                    port = serverPort,
                                     errorMessage = connectionError,
                                     isConnecting = isConnecting,
                                     onIpChange = { serverIp = it; connectionError = "" },
-                                    onPortChange = { serverPort = it; connectionError = "" },
                                     onConnectClick = {
                                         if (permissionsGranted) {
                                             initiateConnection()
@@ -171,7 +175,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                                     }
                                 )
                                 AppState.STREAMING -> {
-                                    // Manual Disconnect via Back Button
                                     BackHandler {
                                         stopHardwareStreams()
                                         udpStreamer.disconnect()
@@ -199,17 +202,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         connectionError = ""
 
         CoroutineScope(Dispatchers.Main).launch {
-            val success = udpStreamer.connectAndHandshake(serverIp, serverPort.toInt())
+            val success = udpStreamer.connectAndHandshake(serverIp)
             isConnecting = false
 
             if (success) {
                 hasReceivedAccel = false
                 hasReceivedGyro = false
                 currentAppState = AppState.STREAMING
+
                 startHardwareStreams()
 
-                // Start monitoring the connection for unexpected drops
-                udpStreamer.startHeartbeat(
+                udpStreamer.startStreaming(
                     onDisconnected = {
                         stopHardwareStreams()
                         udpStreamer.disconnect()
@@ -226,14 +229,24 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private fun startHardwareStreams() {
         val accel = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         val gyro = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
-        accel?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST) }
-        gyro?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST) }
+
+        sensorThread = HandlerThread("ImuThread", Process.THREAD_PRIORITY_URGENT_AUDIO).apply {
+            start()
+        }
+        sensorHandler = Handler(sensorThread!!.looper)
+
+        accel?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST, sensorHandler) }
+        gyro?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST, sensorHandler) }
     }
 
     private fun stopHardwareStreams() {
         sensorManager.unregisterListener(this)
+        sensorThread?.quitSafely()
+        sensorThread = null
+        sensorHandler = null
     }
 
+    @SuppressLint("DefaultLocale")
     override fun onSensorChanged(event: SensorEvent?) {
         event?.let {
             val currentTime = System.currentTimeMillis()
@@ -250,7 +263,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             }
 
             if (currentAppState == AppState.STREAMING && hasReceivedAccel && hasReceivedGyro) {
-                val dataString = "${currentTime},${latestAccel[0]},${latestAccel[1]},${latestAccel[2]},${latestGyro[0]},${latestGyro[1]},${latestGyro[2]}"
+                val dataString = "${latestAccel[0]},${latestAccel[1]},${latestAccel[2]},${latestGyro[0]},${latestGyro[1]},${latestGyro[2]}"
                 udpStreamer.sendImuData(dataString)
             }
 
@@ -276,112 +289,142 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 // --- NETWORKING CLASS ---
 
 class UdpStreamer {
-    private var socket: DatagramSocket? = null
-    private var serverAddress: InetAddress? = null
-    private var port: Int = 0
+    private var pingSocket: DatagramSocket? = null
+    private var imuSocket: DatagramSocket? = null
+    private var imgSocket: DatagramSocket? = null
 
-    private val ioScope = CoroutineScope(Dispatchers.IO)
-    private var heartbeatJob: Job? = null
+    private var serverAddress: InetAddress? = null
+
+    private val networkScope = CoroutineScope(Dispatchers.IO)
     private var isIntentionallyClosed = false
 
-    suspend fun connectAndHandshake(ip: String, targetPort: Int): Boolean = withContext(Dispatchers.IO) {
+    private val imuChannel = Channel<String>(Channel.UNLIMITED)
+    private val imageChannel = Channel<ByteArray>(Channel.CONFLATED)
+
+    // Hardcoded Destination Ports
+    private val portPING = 60000
+    private val portIMU = 60001
+    private val portIMG = 60002
+
+    suspend fun connectAndHandshake(ip: String): Boolean = withContext(Dispatchers.IO) {
         try {
-            port = targetPort
             serverAddress = InetAddress.getByName(ip)
-            socket = DatagramSocket()
+
+            pingSocket = DatagramSocket()
+            imuSocket = DatagramSocket()
+            imgSocket = DatagramSocket()
+
             isIntentionallyClosed = false
 
-            socket?.soTimeout = 2000
+            pingSocket?.soTimeout = 2000
 
+            // Handshake happens on the PING port
             val pingData = "PING".toByteArray()
-            val pingPacket = DatagramPacket(pingData, pingData.size, serverAddress, port)
-            socket?.send(pingPacket)
+            val pingPacket = DatagramPacket(pingData, pingData.size, serverAddress, portPING)
+            pingSocket?.send(pingPacket)
 
             val ackBuffer = ByteArray(256)
             val ackPacket = DatagramPacket(ackBuffer, ackBuffer.size)
-            socket?.receive(ackPacket)
+            pingSocket?.receive(ackPacket)
 
             val response = String(ackPacket.data, 0, ackPacket.length).trim()
             return@withContext response == "ACK"
 
         } catch (e: Exception) {
             Log.e("SKMapNetwork", "Handshake failed: ${e.message}")
-            socket?.close()
-            socket = null
+            disconnect()
             return@withContext false
         }
     }
 
-    fun startHeartbeat(onDisconnected: () -> Unit) {
-        heartbeatJob = ioScope.launch {
+    fun startStreaming(onDisconnected: () -> Unit) {
+        networkScope.coroutineContext.cancelChildren()
+        pingSocket?.soTimeout = 3000
+
+        // -----------------------------------------
+        // PING Lane (Destination: 60000)
+        // -----------------------------------------
+        networkScope.launch {
             try {
-                // If we don't get an ACK within 3 seconds, assume connection is dead
-                socket?.soTimeout = 3000
-
                 while (isActive && !isIntentionallyClosed) {
-                    delay(2000.milliseconds) // Wait 2 seconds between pings
+                    delay(2000.milliseconds)
 
-                    if (isIntentionallyClosed || socket == null || socket?.isClosed == true) break
+                    if (isIntentionallyClosed || pingSocket == null || pingSocket?.isClosed == true) break
 
                     val pingData = "PING".toByteArray()
-                    val pingPacket = DatagramPacket(pingData, pingData.size, serverAddress, port)
-                    socket?.send(pingPacket)
+                    val pingPacket = DatagramPacket(pingData, pingData.size, serverAddress, portPING)
+                    pingSocket?.send(pingPacket)
 
                     val ackBuffer = ByteArray(256)
                     val ackPacket = DatagramPacket(ackBuffer, ackBuffer.size)
 
-                    // This will block until an ACK is received OR 3 seconds pass (triggering an exception)
-                    socket?.receive(ackPacket)
+                    pingSocket?.receive(ackPacket)
 
                     val response = String(ackPacket.data, 0, ackPacket.length).trim()
-                    if (response != "ACK") {
-                        throw Exception("Invalid response received")
-                    }
+                    if (response != "ACK") throw Exception("Invalid ping response")
                 }
             } catch (e: Exception) {
-                // Ignore the error if the user pressed the back button to disconnect manually
                 if (!isIntentionallyClosed) {
-                    Log.e("SKMapNetwork", "Connection lost: ${e.message}")
-                    withContext(Dispatchers.Main) {
-                        onDisconnected()
-                    }
+                    Log.e("SKMapNetwork", "Connection lost in Ping Loop: ${e.message}")
+                    withContext(Dispatchers.Main) { onDisconnected() }
                 }
+            }
+        }
+
+        // -----------------------------------------
+        // IMU Lane (Destination: 60001)
+        // -----------------------------------------
+        networkScope.launch {
+            for (data in imuChannel) {
+                if (imuSocket?.isClosed == true || isIntentionallyClosed) break
+                try {
+                    val timestamp = System.currentTimeMillis()
+                    val payload = "IMU|$timestamp|$data".toByteArray()
+
+                    val packet = DatagramPacket(payload, payload.size, serverAddress, portIMU)
+                    imuSocket?.send(packet)
+                } catch (_: Exception) { }
+            }
+        }
+
+        // -----------------------------------------
+        // Image Lane (Destination: 60002)
+        // -----------------------------------------
+        networkScope.launch {
+            for (jpegBytes in imageChannel) {
+                if (imgSocket?.isClosed == true || isIntentionallyClosed) break
+                try {
+                    val timestamp = System.currentTimeMillis()
+                    val header = "IMG|$timestamp|".toByteArray()
+                    val payload = header + jpegBytes
+
+                    val packet = DatagramPacket(payload, payload.size, serverAddress, portIMG)
+                    imgSocket?.send(packet)
+                } catch (_: Exception) { }
             }
         }
     }
 
     fun sendImuData(dataString: String) {
-        if (socket == null || socket?.isClosed == true) return
-        ioScope.launch {
-            try {
-                val payload = "IMU|$dataString".toByteArray()
-                val packet = DatagramPacket(payload, payload.size, serverAddress, port)
-                socket?.send(packet)
-            } catch (_: Exception) {
-                // Log silently on UDP drops
-            }
-        }
+        imuChannel.trySend(dataString)
     }
 
     fun sendImageData(jpegBytes: ByteArray) {
-        if (socket == null || socket?.isClosed == true) return
-        ioScope.launch {
-            try {
-                val prefix = "IMG|".toByteArray()
-                val payload = prefix + jpegBytes
-                val packet = DatagramPacket(payload, payload.size, serverAddress, port)
-                socket?.send(packet)
-            } catch (e: Exception) {
-                Log.e("SKMapNetwork", "Failed to send Image", e)
-            }
-        }
+        imageChannel.trySend(jpegBytes)
     }
 
     fun disconnect() {
         isIntentionallyClosed = true
-        heartbeatJob?.cancel()
-        socket?.close()
-        socket = null
+        networkScope.coroutineContext.cancelChildren()
+
+        pingSocket?.close()
+        pingSocket = null
+
+        imuSocket?.close()
+        imuSocket = null
+
+        imgSocket?.close()
+        imgSocket = null
     }
 }
 
@@ -400,8 +443,8 @@ fun SplashScreen(onTimeout: () -> Unit) {
 
 @Composable
 fun ConnectScreen(
-    ip: String, port: String, errorMessage: String, isConnecting: Boolean,
-    onIpChange: (String) -> Unit, onPortChange: (String) -> Unit, onConnectClick: () -> Unit
+    ip: String, errorMessage: String, isConnecting: Boolean,
+    onIpChange: (String) -> Unit, onConnectClick: () -> Unit
 ) {
     Column(
         modifier = Modifier.fillMaxSize().padding(32.dp),
@@ -411,8 +454,6 @@ fun ConnectScreen(
         Text("Configure Connection", fontSize = 24.sp, fontWeight = FontWeight.SemiBold)
         Spacer(modifier = Modifier.height(32.dp))
         OutlinedTextField(value = ip, onValueChange = onIpChange, label = { Text("SKMap Desktop Client IP Address") }, modifier = Modifier.fillMaxWidth())
-        Spacer(modifier = Modifier.height(16.dp))
-        OutlinedTextField(value = port, onValueChange = onPortChange, label = { Text("SKMap Desktop Client Port") }, modifier = Modifier.fillMaxWidth())
 
         if (errorMessage.isNotEmpty()) {
             Spacer(modifier = Modifier.height(16.dp))
@@ -486,32 +527,42 @@ fun CameraFeed(executor: ExecutorService, streamer: UdpStreamer) {
         factory = { ctx ->
             val previewView = PreviewView(ctx)
             val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
+
             cameraProviderFuture.addListener({
                 val cameraProvider = cameraProviderFuture.get()
                 val preview = Preview.Builder().build().also { it.surfaceProvider = previewView.surfaceProvider }
                 val imageAnalysis = ImageAnalysis.Builder()
-                    .setTargetResolution(Size(640, 480))
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
+
+                var nv21Buffer: ByteArray? = null
+                val outStream = ByteArrayOutputStream(640 * 480 * 2)
 
                 imageAnalysis.setAnalyzer(executor) { imageProxy ->
                     if (imageProxy.format == ImageFormat.YUV_420_888) {
                         val yBuffer = imageProxy.planes[0].buffer
                         val uBuffer = imageProxy.planes[1].buffer
                         val vBuffer = imageProxy.planes[2].buffer
+
                         val ySize = yBuffer.remaining()
                         val uSize = uBuffer.remaining()
                         val vSize = vBuffer.remaining()
-                        val nv21 = ByteArray(ySize + uSize + vSize)
-                        yBuffer.get(nv21, 0, ySize)
-                        vBuffer.get(nv21, ySize, vSize)
-                        uBuffer.get(nv21, ySize + vSize, uSize)
+                        val totalSize = ySize + uSize + vSize
 
-                        val out = ByteArrayOutputStream()
-                        val yuvImage = YuvImage(nv21, ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
-                        yuvImage.compressToJpeg(Rect(0, 0, imageProxy.width, imageProxy.height), 70, out)
+                        if (nv21Buffer == null || nv21Buffer!!.size != totalSize) {
+                            nv21Buffer = ByteArray(totalSize)
+                        }
 
-                        streamer.sendImageData(out.toByteArray())
+                        yBuffer.get(nv21Buffer, 0, ySize)
+                        vBuffer.get(nv21Buffer, ySize, vSize)
+                        uBuffer.get(nv21Buffer, ySize + vSize, uSize)
+
+                        outStream.reset()
+
+                        val yuvImage = YuvImage(nv21Buffer, ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
+                        yuvImage.compressToJpeg(Rect(0, 0, imageProxy.width, imageProxy.height), 70, outStream)
+
+                        streamer.sendImageData(outStream.toByteArray())
                     }
                     imageProxy.close()
                 }
@@ -519,7 +570,7 @@ fun CameraFeed(executor: ExecutorService, streamer: UdpStreamer) {
                 try {
                     cameraProvider.unbindAll()
                     cameraProvider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalysis)
-                } catch (exc: Exception) { Log.e("SlamHardware", "Camera binding failed", exc) }
+                } catch (exc: Exception) { Log.e("SKMapHardware", "Camera binding failed", exc) }
             }, ContextCompat.getMainExecutor(ctx))
             previewView
         },
