@@ -288,9 +288,9 @@ class UdpStreamer {
     private val imageChannel = Channel<ByteArray>(Channel.CONFLATED)
 
     // Hardcoded Destination Ports
-    private val PORT_PING = 60000
-    private val PORT_IMU = 60001
-    private val PORT_IMG = 60002
+    private val portPING = 60000
+    private val portIMU = 60001
+    private val portIMG = 60002
 
     /**
      * Initializes sockets and ensures the receiver is active.
@@ -305,7 +305,7 @@ class UdpStreamer {
 
             // Handshake request
             val pingData = "PING".toByteArray()
-            val pingPacket = DatagramPacket(pingData, pingData.size, serverAddress, PORT_PING)
+            val pingPacket = DatagramPacket(pingData, pingData.size, serverAddress, portPING)
             pingSocket?.send(pingPacket)
 
             // Handshake acknowledgment
@@ -336,7 +336,7 @@ class UdpStreamer {
                     if (isIntentionallyClosed || pingSocket?.isClosed == true) break
 
                     val pingData = "PING".toByteArray()
-                    pingSocket?.send(DatagramPacket(pingData, pingData.size, serverAddress, PORT_PING))
+                    pingSocket?.send(DatagramPacket(pingData, pingData.size, serverAddress, portPING))
 
                     val ackPacket = DatagramPacket(ByteArray(256), 256)
                     pingSocket?.receive(ackPacket)
@@ -359,7 +359,7 @@ class UdpStreamer {
                 if (imuSocket?.isClosed == true || isIntentionallyClosed) break
                 try {
                     val payload = "IMU|${System.currentTimeMillis()}|$data".toByteArray()
-                    imuSocket?.send(DatagramPacket(payload, payload.size, serverAddress, PORT_IMU))
+                    imuSocket?.send(DatagramPacket(payload, payload.size, serverAddress, portIMU))
                 } catch (_: Exception) { }
             }
         }
@@ -371,7 +371,7 @@ class UdpStreamer {
                 try {
                     val header = "IMG|${System.currentTimeMillis()}|".toByteArray()
                     val payload = header + jpegBytes
-                    imgSocket?.send(DatagramPacket(payload, payload.size, serverAddress, PORT_IMG))
+                    imgSocket?.send(DatagramPacket(payload, payload.size, serverAddress, portIMG))
                 } catch (_: Exception) { }
             }
         }
@@ -531,9 +531,9 @@ fun CameraFeed(executor: ExecutorService, streamer: UdpStreamer) {
                             nv21Buffer = ByteArray(totalSize)
                         }
 
-                        yBuffer.get(nv21Buffer!!, 0, ySize)
-                        vBuffer.get(nv21Buffer!!, ySize, vSize)
-                        uBuffer.get(nv21Buffer!!, ySize + vSize, uSize)
+                        yBuffer.get(nv21Buffer, 0, ySize)
+                        vBuffer.get(nv21Buffer, ySize, vSize)
+                        uBuffer.get(nv21Buffer, ySize + vSize, uSize)
 
                         outStream.reset()
                         val yuvImage = YuvImage(nv21Buffer, ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
