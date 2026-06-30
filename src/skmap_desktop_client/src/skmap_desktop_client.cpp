@@ -107,7 +107,7 @@ class SKMapDesktopClientNode : public rclcpp::Node
             }
         }
 
-        void img_loop()
+        void loopIMG()
         {
             boost::asio::ip::udp::endpoint sender_endpoint;
             boost::system::error_code error;
@@ -185,7 +185,7 @@ class SKMapDesktopClientNode : public rclcpp::Node
 
             this->ping_thread = std::thread(&SKMapDesktopClientNode::loopPING, this);
             this->imu_thread = std::thread(&SKMapDesktopClientNode::loopIMU, this);
-            this->img_thread = std::thread(&SKMapDesktopClientNode::img_loop, this);
+            this->img_thread = std::thread(&SKMapDesktopClientNode::loopIMG, this);
 
         }
 
