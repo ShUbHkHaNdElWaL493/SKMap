@@ -29,10 +29,35 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.shadow
@@ -42,15 +67,19 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import kotlinx.coroutines.*
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.time.Duration.Companion.milliseconds
@@ -91,7 +120,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     // Data Processing State
     private var lastUiUpdateTime = 0L
-    private val timeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault())
     private val latestAccel = floatArrayOf(0f, 0f, 0f)
     private val latestGyro = floatArrayOf(0f, 0f, 0f)
     private var hasReceivedAccel = false
@@ -235,7 +263,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     @SuppressLint("DefaultLocale")
     override fun onSensorChanged(event: SensorEvent?) {
         if (event == null) return
-        val currentTime = System.currentTimeMillis()
+
+        // Capture the hardware timestamp in nanoseconds
+        val hardwareTimestampNs = event.timestamp
 
         when (event.sensor.type) {
             Sensor.TYPE_ACCELEROMETER -> {
@@ -250,16 +280,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
         // Only stream if we have both data points initialized
         if (currentAppState == AppState.STREAMING && hasReceivedAccel && hasReceivedGyro) {
-            val dataString = "${latestAccel[0]},${latestAccel[1]},${latestAccel[2]},${latestGyro[0]},${latestGyro[1]},${latestGyro[2]}"
-            udpStreamer.sendImuData(dataString)
+            udpStreamer.sendImuData(hardwareTimestampNs, "${latestAccel[0]},${latestAccel[1]},${latestAccel[2]},${latestGyro[0]},${latestGyro[1]},${latestGyro[2]}")
         }
 
         // Throttle UI updates to 10Hz (every 100ms) to prevent UI thread lockup
-        if (currentTime - lastUiUpdateTime > 100) {
-            timestampText = timeFormat.format(Date(currentTime))
+        if (hardwareTimestampNs - lastUiUpdateTime > 100_000_000L) {
+            val secs = (hardwareTimestampNs - hardwareTimestampNs % 1_000_000_000L) / 1_000_000_000L
+            val nanosecs = hardwareTimestampNs % 1_000_000_000L
+            timestampText = "${secs}s ${nanosecs}ns"
             accelText = "X: ${String.format("%.2f", latestAccel[0])} | Y: ${String.format("%.2f", latestAccel[1])} | Z: ${String.format("%.2f", latestAccel[2])}"
             gyroText = "X: ${String.format("%.2f", latestGyro[0])} | Y: ${String.format("%.2f", latestGyro[1])} | Z: ${String.format("%.2f", latestGyro[2])}"
-            lastUiUpdateTime = currentTime
+            lastUiUpdateTime = hardwareTimestampNs
         }
     }
 
@@ -288,7 +319,7 @@ class UdpStreamer {
     private val networkScope = CoroutineScope(Dispatchers.IO)
     private var isIntentionallyClosed = false
 
-    private val imuChannel = Channel<String>(Channel.UNLIMITED)
+    private val imuChannel = Channel<ByteArray>(Channel.UNLIMITED)
     private val imageChannel = Channel<ByteArray>(Channel.CONFLATED)
 
     // Hardcoded Destination Ports
@@ -359,10 +390,9 @@ class UdpStreamer {
 
         // IMU Lane
         networkScope.launch {
-            for (data in imuChannel) {
+            for (payload in imuChannel) {
                 if (imuSocket?.isClosed == true || isIntentionallyClosed) break
                 try {
-                    val payload = "IMU|${System.currentTimeMillis()}|$data".toByteArray()
                     imuSocket?.send(DatagramPacket(payload, payload.size, serverAddress, portIMU))
                 } catch (_: Exception) { }
             }
@@ -370,19 +400,17 @@ class UdpStreamer {
 
         // Image Lane
         networkScope.launch {
-            for (jpegBytes in imageChannel) {
+            for (payload in imageChannel) {
                 if (imgSocket?.isClosed == true || isIntentionallyClosed) break
                 try {
-                    val header = "IMG|${System.currentTimeMillis()}|".toByteArray()
-                    val payload = header + jpegBytes
                     imgSocket?.send(DatagramPacket(payload, payload.size, serverAddress, portIMG))
                 } catch (_: Exception) { }
             }
         }
     }
 
-    fun sendImuData(dataString: String) = imuChannel.trySend(dataString)
-    fun sendImageData(jpegBytes: ByteArray) = imageChannel.trySend(jpegBytes)
+    fun sendImuData(hardwareTimestampNs: Long, dataString: String) = imuChannel.trySend("IMU|${hardwareTimestampNs}|$dataString".toByteArray())
+    fun sendImageData(hardwareTimestampNs: Long, jpegBytes: ByteArray) = imageChannel.trySend("IMG|${hardwareTimestampNs}|".toByteArray() + jpegBytes)
 
     fun disconnect() {
         isIntentionallyClosed = true
@@ -410,7 +438,9 @@ fun SplashScreen(onTimeout: () -> Unit) {
     }
     Box(
         contentAlignment = Alignment.Center,
-        modifier = Modifier.fillMaxSize().background(Color(0xFF1E1E1E))
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF1E1E1E))
     ) {
         Text("SKMap", color = Color(0xFFC62A2A), fontSize = 56.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
     }
@@ -425,7 +455,9 @@ fun ConnectScreen(
     onConnectClick: () -> Unit
 ) {
     Column(
-        modifier = Modifier.fillMaxSize().padding(32.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
@@ -448,7 +480,9 @@ fun ConnectScreen(
 
         Button(
             onClick = onConnectClick,
-            modifier = Modifier.fillMaxWidth().height(56.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp),
             enabled = !isConnecting
         ) {
             if (isConnecting) {
@@ -462,8 +496,12 @@ fun ConnectScreen(
 
 @Composable
 fun DashboardScreen(accel: String, gyro: String, timestamp: String, executor: ExecutorService, streamer: UdpStreamer) {
-    Column(modifier = Modifier.fillMaxSize().padding(20.dp)) {
-        Column(modifier = Modifier.weight(1.2f).fillMaxWidth()) {
+    Column(modifier = Modifier
+        .fillMaxSize()
+        .padding(20.dp)) {
+        Column(modifier = Modifier
+            .weight(1.2f)
+            .fillMaxWidth()) {
             Text("Camera Feed", fontSize = 14.sp, color = Color.Gray, fontWeight = FontWeight.Medium)
             Spacer(modifier = Modifier.height(8.dp))
             Card(
@@ -471,7 +509,9 @@ fun DashboardScreen(accel: String, gyro: String, timestamp: String, executor: Ex
                 shape = RoundedCornerShape(12.dp),
                 elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
             ) {
-                Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+                Box(modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black)) {
                     CameraFeed(executor, streamer)
                 }
             }
@@ -481,7 +521,9 @@ fun DashboardScreen(accel: String, gyro: String, timestamp: String, executor: Ex
         HorizontalDivider()
         Spacer(modifier = Modifier.height(16.dp))
 
-        Column(modifier = Modifier.weight(1f).fillMaxWidth(), verticalArrangement = Arrangement.SpaceEvenly) {
+        Column(modifier = Modifier
+            .weight(1f)
+            .fillMaxWidth(), verticalArrangement = Arrangement.SpaceEvenly) {
             DataSectionBlock("Accelerometer (m/s²)", accel)
             DataSectionBlock("Gyroscope (rad/s)", gyro)
             HorizontalDivider()
@@ -501,7 +543,7 @@ fun DataSectionBlock(title: String, value: String) {
 
 @Composable
 fun CameraFeed(executor: ExecutorService, streamer: UdpStreamer) {
-    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     AndroidView(
         factory = { ctx ->
@@ -521,6 +563,7 @@ fun CameraFeed(executor: ExecutorService, streamer: UdpStreamer) {
                 val outStream = ByteArrayOutputStream(640 * 480 * 2)
 
                 imageAnalysis.setAnalyzer(executor) { imageProxy ->
+                    val hardwareTimestampNs = imageProxy.imageInfo.timestamp
                     if (imageProxy.format == ImageFormat.YUV_420_888) {
                         val yBuffer = imageProxy.planes[0].buffer
                         val uBuffer = imageProxy.planes[1].buffer
@@ -543,7 +586,7 @@ fun CameraFeed(executor: ExecutorService, streamer: UdpStreamer) {
                         val yuvImage = YuvImage(nv21Buffer, ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
                         yuvImage.compressToJpeg(Rect(0, 0, imageProxy.width, imageProxy.height), 70, outStream)
 
-                        streamer.sendImageData(outStream.toByteArray())
+                        streamer.sendImageData(hardwareTimestampNs, outStream.toByteArray())
                     }
                     imageProxy.close()
                 }
